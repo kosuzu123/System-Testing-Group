@@ -7,8 +7,10 @@ from urllib.parse import parse_qs, urlparse
 
 from selenium.common.exceptions import (
     NoSuchElementException, StaleElementReferenceException, TimeoutException,
+    WebDriverException,
 )
 from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import Select, WebDriverWait
 
@@ -62,7 +64,24 @@ class Shop:
 
     def visible(self, by, value, root=None):
         root = self.driver if root is None else root
-        return [e for e in root.find_elements(by, value) if e.is_displayed()]
+        def read(_):
+            try:
+                # Wrap even an empty list so a successful read ends the retry.
+                return {"elements": [e for e in root.find_elements(by, value)
+                                     if e.is_displayed()]}
+            except WebDriverException as exc:
+                # Chrome can invalidate an inspector node during a DOM update.
+                # Retry this read only; never repeat a cart-changing click.
+                if "Node with given id does not belong to the document" not in str(exc):
+                    raise
+                return False
+        return self.wait.until(read)["elements"]
+
+    def idle(self):
+        """Finish navigation and pending page AJAX before the next UI action."""
+        self.wait.until(lambda d: d.execute_script(
+            'return document.readyState === "complete" && '
+            '(!window.jQuery || window.jQuery.active === 0);'))
 
     def one(self, by, value, root=None):
         """Fail visibly if a locator becomes ambiguous instead of clicking blindly."""
@@ -78,6 +97,7 @@ class Shop:
 
     def open_cart(self):
         self.driver.get(CART_URL)
+        self.idle()
         self.one(By.ID, "content")
 
     def set_us_dollars(self):
@@ -86,12 +106,14 @@ class Shop:
         self.one(By.CSS_SELECTOR, '#form-currency button.dropdown-toggle').click()
         self.one(By.CSS_SELECTOR, '#form-currency button[name="USD"]').click()
         self.wait.until(EC.staleness_of(old_content))
+        self.idle()
         self.one(By.ID, "content")
         if not self.one(By.CSS_SELECTOR, '#form-currency button.dropdown-toggle').text.strip().startswith("$"):
             raise SetupIssue("Could not establish the US Dollar currency baseline")
 
     def open_product(self, pid):
         self.driver.get(PRODUCTS[pid].url)
+        self.idle()
         self.one(By.ID, "input-quantity")
         if product_id(self.driver.current_url) != pid:
             raise SetupIssue(f"Expected product_id={pid}; URL={self.driver.current_url}")
@@ -127,10 +149,16 @@ class Shop:
 
     def set_product_quantity(self, value):
         field = self.one(By.ID, "input-quantity")
-        field.clear()
-        field.send_keys(str(value))
+        if field.get_attribute("value") != str(value):
+            field.clear()
+            field.send_keys(str(value))
+        # Blur fires the quantity change handler. Its AJAX callback removes
+        # alerts, so it must finish before Add to Cart creates a success alert.
+        field.send_keys(Keys.TAB)
+        self.idle()
 
     def click_add(self):
+        self.idle()
         self.one(By.ID, "button-cart").click()
 
     def success_alerts(self, pid):
